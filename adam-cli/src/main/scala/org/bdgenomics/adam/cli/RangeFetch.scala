@@ -1,5 +1,6 @@
 package org.bdgenomics.adam.cli
 
+import java.io.PrintStream
 import org.apache.hadoop.mapreduce.Job
 import org.apache.spark.SparkContext
 import org.apache.spark.rdd.RDD
@@ -43,6 +44,6 @@ class RangeFetch(protected val args: RangeFetchArgs) extends ADAMSparkCommand[Ra
 
     val reads: RDD[AlignmentRecord] = (adamRDD).filter(filterGen(args.input2, args.input3, args.input4))
 
-    reads.collect.foreach(scala.Console.out.println)
+    reads.collect.foreach(println)
   }
 }
