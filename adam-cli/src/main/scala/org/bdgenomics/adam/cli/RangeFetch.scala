@@ -9,7 +9,7 @@ import org.bdgenomics.formats.avro.AlignmentRecord
 import org.bdgenomics.adam.rdd.ADAMContext._
 
 object RangeFetch extends ADAMCommandCompanion {
-  val commandName: String = "RangeFetch"
+  val commandName: String = "rangefetch"
   val commandDescription: String = "Prints out the entries from an ADAM file that match the given range"
 
   def apply(cmdLine: Array[String]) = {
