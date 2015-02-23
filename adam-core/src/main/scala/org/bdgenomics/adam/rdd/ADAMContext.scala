@@ -17,29 +17,33 @@
  */
 package org.bdgenomics.adam.rdd
 
-import org.apache.spark.rdd.RDD
-import org.bdgenomics.utils.instrumentation.Metrics
-import org.seqdoop.hadoop_bam.util.SAMHeaderReader
-import org.seqdoop.hadoop_bam.{ AnySAMInputFormat, SAMRecordWritable }
 import java.util.regex.Pattern
 import htsjdk.samtools.SAMFileHeader
 import org.apache.avro.Schema
 import org.apache.avro.specific.SpecificRecord
 import org.apache.hadoop.fs.{ FileSystem, Path }
-import org.apache.hadoop.io.LongWritable
+import org.apache.hadoop.io.{ LongWritable, Text }
+import org.apache.hadoop.mapreduce.lib.input.TextInputFormat
+import org.apache.spark.rdd.RDD
 import org.apache.spark.rdd.MetricsContext._
 import org.apache.spark.{ Logging, SparkConf, SparkContext }
-import org.bdgenomics.adam.converters.SAMRecordConverter
+import org.bdgenomics.adam.converters._
 import org.bdgenomics.adam.instrumentation.Timers._
+import org.bdgenomics.adam.io._
 import org.bdgenomics.adam.models._
 import org.bdgenomics.adam.predicates.ADAMPredicate
 import org.bdgenomics.adam.projections.{ AlignmentRecordField, NucleotideContigFragmentField, Projection }
-import org.bdgenomics.adam.rdd.read.AlignmentRecordContext
-import org.bdgenomics.adam.rdd.variation.VariationContext._
-
+import org.bdgenomics.adam.rdd.contig.NucleotideContigFragmentRDDFunctions
+import org.bdgenomics.adam.rdd.features._
+import org.bdgenomics.adam.rdd.pileup.{ PileupRDDFunctions, RodRDDFunctions }
+import org.bdgenomics.adam.rdd.read.AlignmentRecordRDDFunctions
+import org.bdgenomics.adam.rdd.variation._
 import org.bdgenomics.adam.rich.RichAlignmentRecord
 import org.bdgenomics.adam.util.HadoopUtil
-import org.bdgenomics.formats.avro.{ AlignmentRecord, NucleotideContigFragment, Pileup, Genotype }
+import org.bdgenomics.formats.avro._
+import org.bdgenomics.utils.instrumentation.Metrics
+import org.seqdoop.hadoop_bam.util.SAMHeaderReader
+import org.seqdoop.hadoop_bam._
 import parquet.avro.{ AvroParquetInputFormat, AvroReadSupport }
 import parquet.filter.UnboundRecordFilter
 import parquet.hadoop.ParquetInputFormat
@@ -54,6 +58,25 @@ object ADAMContext {
 
   // Add generic RDD methods for all types of ADAM RDDs
   implicit def rddToADAMRDD[T](rdd: RDD[T])(implicit ev1: T => SpecificRecord, ev2: Manifest[T]): ADAMRDDFunctions[T] = new ADAMRDDFunctions(rdd)
+
+  // Add methods specific to Read RDDs
+  implicit def rddToADAMRecordRDD(rdd: RDD[AlignmentRecord]) = new AlignmentRecordRDDFunctions(rdd)
+
+  // Add methods specific to the Pileup RDDs
+  implicit def rddToPileupRDD(rdd: RDD[Pileup]) = new PileupRDDFunctions(rdd)
+
+  // Add methods specific to the Rod RDDs
+  implicit def rddToRodRDD(rdd: RDD[Rod]) = new RodRDDFunctions(rdd)
+
+  // Add methods specific to the ADAMNucleotideContig RDDs
+  implicit def rddToContigFragmentRDD(rdd: RDD[NucleotideContigFragment]) = new NucleotideContigFragmentRDDFunctions(rdd)
+
+  // implicit conversions for variant related rdds
+  implicit def rddToVariantContextRDD(rdd: RDD[VariantContext]) = new VariantContextRDDFunctions(rdd)
+  implicit def rddToADAMGenotypeRDD(rdd: RDD[Genotype]) = new GenotypeRDDFunctions(rdd)
+
+  // add gene feature rdd functions
+  implicit def convertBaseFeatureRDDToGeneFeatureRDD(rdd: RDD[Feature]) = new GeneFeatureRDDFunctions(rdd)
 
   // Add implicits for the rich adam objects
   implicit def recordToRichRecord(record: AlignmentRecord): RichAlignmentRecord = new RichAlignmentRecord(record)
@@ -84,6 +107,8 @@ object ADAMContext {
 
   implicit def setToJavaSet[A](set: Set[A]): java.util.Set[A] = setAsJavaSet(set)
 }
+
+import ADAMContext._
 
 class ADAMContext(val sc: SparkContext) extends Serializable with Logging {
 
@@ -261,49 +286,194 @@ class ADAMContext(val sc: SparkContext) extends Serializable with Logging {
 
     if (filePath.endsWith(".ifq")) {
 
+      log.info("Reading interleaved FASTQ file format %s to create RDD".format(filePath))
       if (projection.isDefined) {
         log.warn("Projection is ignored when loading an interleaved FASTQ file")
       }
-      val reads = AlignmentRecordContext.adamInterleavedFastqLoad(sc, filePath)
 
-      Some(applyPredicate(reads, predicate))
+      val job = HadoopUtil.newJob(sc)
+      val records = sc.newAPIHadoopFile(
+        filePath,
+        classOf[InterleavedFastqInputFormat],
+        classOf[Void],
+        classOf[Text],
+        ContextUtil.getConfiguration(job)
+      )
 
+      // convert records
+      val fastqRecordConverter = new FastqRecordConverter
+      Some(applyPredicate(records.flatMap(fastqRecordConverter.convertPair), predicate))
     } else if (filePath.endsWith(".fastq") || filePath.endsWith(".fq")) {
 
+      log.info("Reading unpaired FASTQ file format %s to create RDD".format(filePath))
       if (projection.isDefined) {
         log.warn("Projection is ignored when loading a FASTQ file")
       }
-      val reads = AlignmentRecordContext.adamUnpairedFastqLoad(sc, filePath)
 
-      Some(applyPredicate(reads, predicate))
+      val job = HadoopUtil.newJob(sc)
+      val records = sc.newAPIHadoopFile(
+        filePath,
+        classOf[SingleFastqInputFormat],
+        classOf[Void],
+        classOf[Text],
+        ContextUtil.getConfiguration(job)
+      )
+
+      // convert records
+      val fastqRecordConverter = new FastqRecordConverter
+      Some(applyPredicate(records.map(fastqRecordConverter.convertRead), predicate))
     } else
       None
   }
 
-  private def maybeLoadVcf[U <: ADAMPredicate[Genotype]](
+  private def maybeLoadVcf(filePath: String, sd: Option[SequenceDictionary]): Option[RDD[VariantContext]] = {
+    if (filePath.endsWith(".vcf")) {
+      log.info("Reading VCF file from %s".format(filePath))
+      val job = HadoopUtil.newJob(sc)
+      val vcc = new VariantContextConverter(sd)
+      val records = sc.newAPIHadoopFile(
+        filePath,
+        classOf[VCFInputFormat], classOf[LongWritable], classOf[VariantContextWritable],
+        ContextUtil.getConfiguration(job))
+
+      Some(records.flatMap(p => vcc.convert(p._2.get)))
+    } else
+      None
+  }
+
+  private def maybeLoadFasta[U <: ADAMPredicate[NucleotideContigFragment]](
     filePath: String,
     predicate: Option[Class[U]] = None,
-    projection: Option[Schema] = None): Option[RDD[Genotype]] = {
+    projection: Option[Schema] = None,
+    fragmentLength: Long): Option[RDD[NucleotideContigFragment]] = {
+    if (filePath.endsWith(".fasta") || filePath.endsWith(".fa")) {
+      val fastaData: RDD[(LongWritable, Text)] = sc.newAPIHadoopFile(filePath,
+        classOf[TextInputFormat],
+        classOf[LongWritable],
+        classOf[Text])
+
+      val remapData = fastaData.map(kv => (kv._1.get, kv._2.toString))
+
+      log.info("Converting FASTA to ADAM.")
+      Some(FastaConverter(remapData, fragmentLength))
+    } else {
+      None
+    }
+  }
+
+  private def maybeLoadGTF(filePath: String): Option[RDD[Feature]] = {
+    if (filePath.endsWith(".gtf") || filePath.endsWith(".gff")) {
+      Some(sc.textFile(filePath).flatMap(new GTFParser().parse))
+    } else {
+      None
+    }
+  }
+
+  private def maybeLoadBED(filePath: String): Option[RDD[Feature]] = {
+    if (filePath.endsWith(".bed")) {
+      Some(sc.textFile(filePath).flatMap(new BEDParser().parse))
+    } else {
+      None
+    }
+  }
+
+  private def maybeLoadNarrowPeak(filePath: String): Option[RDD[Feature]] = {
+    if (filePath.toLowerCase.endsWith(".narrowpeak")) {
+      Some(sc.textFile(filePath).flatMap(new NarrowPeakParser().parse))
+    } else {
+      None
+    }
+  }
+
+  private def maybeLoadVcfAnnotations[U <: ADAMPredicate[DatabaseVariantAnnotation]](
+    filePath: String,
+    predicate: Option[Class[U]] = None,
+    projection: Option[Schema] = None,
+    sd: Option[SequenceDictionary]): Option[RDD[DatabaseVariantAnnotation]] = {
     if (filePath.endsWith(".vcf")) {
+      log.info("Reading VCF file from %s".format(filePath))
       if (projection.isDefined) {
         log.warn("Projection is ignored when loading a VCF file")
       }
-      val variants = sc.adamVCFLoad(filePath)
-        .flatMap(_.genotypes)
 
-      Some(applyPredicate(variants, predicate))
+      val job = HadoopUtil.newJob(sc)
+      val vcc = new VariantContextConverter(sd)
+      val records = sc.newAPIHadoopFile(
+        filePath,
+        classOf[VCFInputFormat], classOf[LongWritable], classOf[VariantContextWritable],
+        ContextUtil.getConfiguration(job))
+
+      Some(applyPredicate(records.map(p => vcc.convertToAnnotation(p._2.get)), predicate))
     } else
       None
+  }
+
+  def loadVariantAnnotations[U <: ADAMPredicate[DatabaseVariantAnnotation]](
+    filePath: String,
+    predicate: Option[Class[U]] = None,
+    projection: Option[Schema] = None,
+    sd: Option[SequenceDictionary] = None): RDD[DatabaseVariantAnnotation] = {
+    maybeLoadVcfAnnotations(filePath, predicate, projection, sd)
+      .getOrElse({
+        sd.foreach(sd => log.warn("Sequence dictionary for translation ignored if loading ADAM from Parquet."))
+        adamLoad[DatabaseVariantAnnotation, U](filePath, predicate, projection)
+      })
+  }
+
+  def loadFeatures[U <: ADAMPredicate[Feature]](
+    filePath: String,
+    predicate: Option[Class[U]] = None,
+    projection: Option[Schema] = None): RDD[Feature] = {
+    maybeLoadBED(filePath).orElse(
+      maybeLoadGTF(filePath)
+    ).orElse(
+        maybeLoadNarrowPeak(filePath)
+      ).fold(adamLoad[Feature, U](filePath, predicate, projection))(applyPredicate(_, predicate))
+  }
+
+  def loadGenes[U <: ADAMPredicate[Feature]](filePath: String,
+                                             predicate: Option[Class[U]] = None,
+                                             projection: Option[Schema] = None): RDD[Gene] = {
+    new GeneFeatureRDDFunctions(maybeLoadGTF(filePath)
+      .fold(adamLoad[Feature, U](filePath, predicate, projection))(applyPredicate(_, predicate)))
+      .asGenes()
+  }
+
+  def loadSequence[U <: ADAMPredicate[NucleotideContigFragment]](
+    filePath: String,
+    predicate: Option[Class[U]] = None,
+    projection: Option[Schema] = None,
+    fragmentLength: Long = 10000): RDD[NucleotideContigFragment] = {
+    maybeLoadFasta(filePath,
+      predicate,
+      projection,
+      fragmentLength).getOrElse(
+        adamLoad[NucleotideContigFragment, U](filePath, predicate, projection)
+      )
   }
 
   def loadGenotypes[U <: ADAMPredicate[Genotype]](
     filePath: String,
     predicate: Option[Class[U]] = None,
-    projection: Option[Schema] = None): RDD[Genotype] = {
-    maybeLoadVcf(filePath, predicate, projection)
-      .getOrElse(
+    projection: Option[Schema] = None,
+    sd: Option[SequenceDictionary] = None): RDD[Genotype] = {
+    maybeLoadVcf(filePath, sd)
+      .fold({
+        sd.foreach(sd => log.warn("Sequence dictionary for translation ignored if loading ADAM from Parquet."))
         adamLoad[Genotype, U](filePath, predicate, projection)
-      )
+      })(vcRdd => applyPredicate(vcRdd.flatMap(_.genotypes), predicate))
+  }
+
+  def loadVariants[U <: ADAMPredicate[Variant]](
+    filePath: String,
+    predicate: Option[Class[U]] = None,
+    projection: Option[Schema] = None,
+    sd: Option[SequenceDictionary] = None): RDD[Variant] = {
+    maybeLoadVcf(filePath, sd)
+      .fold({
+        sd.foreach(sd => log.warn("Sequence dictionary for translation ignored if loading ADAM from Parquet."))
+        adamLoad[Variant, U](filePath, predicate, projection)
+      })(vcRdd => applyPredicate(vcRdd.map(_.variant.variant), predicate))
   }
 
   def loadAlignments[U <: ADAMPredicate[AlignmentRecord]](
@@ -314,10 +484,31 @@ class ADAMContext(val sc: SparkContext) extends Serializable with Logging {
     val rdd = maybeLoadBam(filePath, predicate, projection)
       .orElse(
         maybeLoadFastq(filePath, predicate, projection)
-      ).getOrElse(
+      ).orElse(
+          maybeLoadFasta(filePath, None, None, 10000).map(_.toReads)
+            .map(applyPredicate(_, predicate)))
+      .getOrElse(
+        if (filePath.endsWith("contig.adam")) {
+          applyPredicate(adamLoad[NucleotideContigFragment, UnboundRecordFilter](filePath).toReads, predicate)
+        } else {
           adamLoad[AlignmentRecord, U](filePath, predicate, projection)
-        )
+        })
     if (Metrics.isRecording) rdd.instrument() else rdd
+  }
+
+  /**
+   * Takes a sequence of Path objects (e.g. the return value of findFiles).  Treats each path as
+   * corresponding to a Read set -- loads each Read set, converts each set to use the
+   * same SequenceDictionary, and returns the union of the RDDs.
+   *
+   * (GenomeBridge is using this to load BAMs that have been split into multiple files per sample,
+   * for example, one-BAM-per-chromosome.)
+   *
+   * @param paths The locations of the parquet files to load
+   * @return a single RDD[Read] that contains the union of the AlignmentRecords in the argument paths.
+   */
+  def loadAlignmentsFromPaths(paths: Seq[Path]): RDD[AlignmentRecord] = {
+    sc.union(paths.map(p => loadAlignments(p.toString)))
   }
 
   /**

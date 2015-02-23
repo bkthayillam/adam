@@ -21,14 +21,13 @@ import java.util.logging.Level
 import org.apache.hadoop.mapreduce.Job
 import org.apache.spark.{ SparkContext, Logging }
 import org.apache.spark.rdd.RDD
-import org.bdgenomics.adam.projections.{ AlignmentRecordField, Projection }
 import org.bdgenomics.adam.rdd.ADAMContext._
 import org.bdgenomics.adam.util.ParquetLogger
-import org.bdgenomics.formats.avro.AlignmentRecord
+import org.bdgenomics.formats.avro.NucleotideContigFragment
 import org.kohsuke.args4j.{ Argument, Option => Args4jOption }
 
-object CountKmers extends ADAMCommandCompanion {
-  val commandName = "count_kmers"
+object CountContigKmers extends ADAMCommandCompanion {
+  val commandName = "count_contig_kmers"
   val commandDescription = "Counts the k-mers/q-mers from a read dataset."
 
   def apply(cmdLine: Array[String]) = {
@@ -36,23 +35,19 @@ object CountKmers extends ADAMCommandCompanion {
   }
 }
 
-class CountKmersArgs extends Args4jBase with ParquetArgs {
-  @Argument(required = true, metaVar = "INPUT", usage = "The ADAM, BAM or SAM file to count kmers from", index = 0)
+class CountContigKmersArgs extends Args4jBase with ParquetArgs {
+  @Argument(required = true, metaVar = "INPUT", usage = "The ADAM or FASTA file to count kmers from", index = 0)
   var inputPath: String = null
   @Argument(required = true, metaVar = "OUTPUT", usage = "Location for storing k-mer counts", index = 1)
   var outputPath: String = null
   @Argument(required = true, metaVar = "KMER_LENGTH", usage = "Length of k-mers", index = 2)
   var kmerLength: Int = 0
-  @Args4jOption(required = false, name = "-countQmers", usage = "Counts q-mers instead of k-mers.")
-  var countQmers: Boolean = false
   @Args4jOption(required = false, name = "-printHistogram", usage = "Prints a histogram of counts.")
   var printHistogram: Boolean = false
-  @Args4jOption(required = false, name = "-repartition", usage = "Set the number of partitions to map data to")
-  var repartition: Int = -1
 }
 
-class CountKmers(protected val args: CountKmersArgs) extends ADAMSparkCommand[CountKmersArgs] with Logging {
-  val companion = CountKmers
+class CountContigKmers(protected val args: CountContigKmersArgs) extends ADAMSparkCommand[CountContigKmersArgs] with Logging {
+  val companion = CountContigKmers
 
   def run(sc: SparkContext, job: Job) {
 
@@ -60,27 +55,16 @@ class CountKmers(protected val args: CountKmersArgs) extends ADAMSparkCommand[Co
     ParquetLogger.hadoopLoggerLevel(Level.SEVERE)
 
     // read from disk
-    var adamRecords: RDD[AlignmentRecord] = sc.loadAlignments(
-      args.inputPath,
-      projection = Some(Projection(AlignmentRecordField.sequence)))
-
-    if (args.repartition != -1) {
-      log.info("Repartitioning reads to '%d' partitions".format(args.repartition))
-      adamRecords = adamRecords.repartition(args.repartition)
-    }
+    var fragments: RDD[NucleotideContigFragment] = sc.loadSequence(args.inputPath)
 
     // count kmers
-    val countedKmers = if (args.countQmers) {
-      adamRecords.adamCountQmers(args.kmerLength)
-    } else {
-      adamRecords.adamCountKmers(args.kmerLength).map(kv => (kv._1, kv._2.toDouble))
-    }
-
-    // cache counted kmers
-    countedKmers.cache()
+    val countedKmers = fragments.countKmers(args.kmerLength)
 
     // print histogram, if requested
     if (args.printHistogram) {
+      // cache counted kmers
+      countedKmers.cache()
+
       countedKmers.map(kv => kv._2.toLong)
         .countByValue()
         .toSeq
@@ -89,11 +73,7 @@ class CountKmers(protected val args: CountKmersArgs) extends ADAMSparkCommand[Co
     }
 
     // save as text file
-    if (args.countQmers) {
-      countedKmers.map(kv => kv._1 + ", " + kv._2)
-    } else {
-      countedKmers.map(kv => kv._1 + ", " + kv._2.toLong)
-    }.saveAsTextFile(args.outputPath)
+    countedKmers.map(kv => kv._1 + ", " + kv._2)
+      .saveAsTextFile(args.outputPath)
   }
-
 }

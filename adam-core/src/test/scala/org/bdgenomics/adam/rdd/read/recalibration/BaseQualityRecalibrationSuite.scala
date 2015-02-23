@@ -21,7 +21,6 @@ import java.io.File
 import org.apache.spark.rdd.RDD
 import org.bdgenomics.adam.models.SnpTable
 import org.bdgenomics.adam.rdd.ADAMContext._
-import org.bdgenomics.adam.rdd.variation.VariationContext._
 import org.bdgenomics.adam.rich.DecadentRead._
 import org.bdgenomics.adam.rich.RichVariant
 import org.bdgenomics.adam.util.ADAMFunSuite
@@ -55,7 +54,7 @@ class BaseQualityRecalibrationSuite extends ADAMFunSuite {
     val obsFilepath = ClassLoader.getSystemClassLoader.getResource("bqsr1-ref.observed").getFile
 
     val reads: RDD[AlignmentRecord] = sc.loadAlignments(readsFilepath)
-    val variants: RDD[RichVariant] = sc.adamVCFLoad(snpsFilepath).map(_.variant)
+    val variants: RDD[RichVariant] = sc.loadVariants(snpsFilepath).map(new RichVariant(_))
     val snps = sc.broadcast(SnpTable(variants))
 
     val bqsr = new BaseQualityRecalibration(cloy(reads), snps)

@@ -22,6 +22,7 @@ import org.apache.avro.specific.SpecificRecord
 import org.apache.spark.Logging
 import org.apache.spark.SparkContext._
 import org.apache.spark.rdd.RDD
+import org.bdgenomics.adam.converters.FragmentConverter
 import org.bdgenomics.adam.models._
 import org.bdgenomics.adam.rdd.ADAMContext._
 import org.bdgenomics.adam.rdd.ADAMSequenceDictionaryRDDAggregator
@@ -38,6 +39,16 @@ import scala.math.max
 import scala.Some
 
 class NucleotideContigFragmentRDDFunctions(rdd: RDD[NucleotideContigFragment]) extends ADAMSequenceDictionaryRDDAggregator[NucleotideContigFragment](rdd) {
+
+  /**
+   * Converts an RDD of nucleotide contig fragments into reads. Adjacent contig fragments are
+   * combined.
+   *
+   * @return Returns an RDD of reads.
+   */
+  def toReads(): RDD[AlignmentRecord] = {
+    FragmentConverter.convertRdd(rdd)
+  }
 
   /**
    * From a set of contigs, returns the base sequence that corresponds to a region of the reference.
@@ -96,5 +107,37 @@ class NucleotideContigFragmentRDDFunctions(rdd: RDD[NucleotideContigFragment]) e
   def getSequenceRecordsFromElement(elem: NucleotideContigFragment): Set[SequenceRecord] = {
     // variant context contains a single locus
     Set(SequenceRecord.fromADAMContigFragment(elem))
+  }
+
+  /**
+   * For all adjacent records in the RDD, we extend the records so that the adjacent
+   * records now overlap by _n_ bases, where _n_ is the flank length.
+   *
+   * @param flankLength The length to extend adjacent records by.
+   * @param optSd An optional sequence dictionary. If none is provided, we recompute the
+   *              sequence dictionary on the fly. Default is None.
+   * @return Returns the RDD, with all adjacent fragments extended with flanking sequence.
+   */
+  def flankAdjacentFragments(flankLength: Int,
+                             optSd: Option[SequenceDictionary] = None): RDD[NucleotideContigFragment] = {
+    FlankReferenceFragments(rdd, optSd.getOrElse(adamGetSequenceDictionary), flankLength)
+  }
+
+  /**
+   * Counts the k-mers contained in a FASTA contig.
+   *
+   * @param kmerLength The length of k-mers to count.
+   * @param optSd An optional sequence dictionary. If none is provided, we recompute the
+   *              sequence dictionary on the fly. Default is None.
+   * @return Returns an RDD containing k-mer/count pairs.
+   */
+  def countKmers(kmerLength: Int,
+                 optSd: Option[SequenceDictionary] = None): RDD[(String, Long)] = {
+    flankAdjacentFragments(kmerLength, optSd).flatMap(r => {
+      // cut each read into k-mers, and attach a count of 1L
+      r.getFragmentSequence
+        .sliding(kmerLength)
+        .map(k => (k, 1L))
+    }).reduceByKey((k1: Long, k2: Long) => k1 + k2)
   }
 }
